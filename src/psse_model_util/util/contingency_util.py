@@ -3,8 +3,7 @@
 Contingency / alternate-path analysis scaffolding. This module is intended to
 process power system contingency definitions, validate network components
 against a PSS/E RAW file model, and generate area-specific contingency files
-with quality separation. Roadmap phase: WIP scaffolding (not yet wired up; the
-package-level ``Model`` import below is not currently importable).
+with quality separation. Roadmap phase: WIP scaffolding (not yet fully wired up).
 
 Key Functionality:
 1. Network model initialization from PSS/E RAW files
@@ -25,7 +24,7 @@ Example Usage:
     >>> from psse_model_util.util.contingency_util import create_area_con_files
     >>> create_area_con_files(
             raw_file="network.raw",
-            input_folder="contingencies",
+            input_folder="inputs",
             output_folder="output"
         )
     Processing 42 contingencies...
@@ -50,10 +49,9 @@ from pathlib import Path  # noqa: E402
 # Third-party imports
 import pandas as pd  # noqa: E402
 
-from psse_model_util import Model  # noqa: E402
-
 # Local imports
 from psse_model_util.common.logging_config import get_log_file_path, setup_logger  # noqa: E402
+from psse_model_util.model import Model  # noqa: E402
 
 print('    Starting logger...')
 logger = setup_logger("contingency_util")
@@ -68,7 +66,7 @@ DEFAULT_OUTPUT_FOLDER: str = BASE_FOLDER + r'\test_output'
 # Voltage filtering parameters (kV thresholds)
 # Contingencies with components outside this range are filtered out
 # unless they contain keywords from KV_EXCEPTIONS
-KV_FILTER: tuple[int, int] = 138, 160  # (min_kv, max_kv)
+KV_FILTER: tuple[int, int] = 115, 765  # (min_kv, max_kv)
 
 # Component type keywords that bypass voltage filtering
 # Contingencies containing these strings are always processed
@@ -96,6 +94,7 @@ MAX_INPUT_FILES: int = 50  # Maximum contingency files to process
 ContingencyInfo = namedtuple(
     "ContingencyInfo",
     [
+        "contingency_name",
         "contingency_definition",
         "unique_areas",
         "bus_numbers",
@@ -196,6 +195,8 @@ def _get_contingency_info(
 
     Returns:
         ContingencyInfo: Named tuple containing:
+            - contingency_name: Name following "CONTINGENCY" on the first line,
+              trimmed of surrounding whitespace and quotes
             - contingency_definition: Original contingency text
             - unique_areas: Sorted list of affected area names
             - bus_numbers: Sorted tuple of referenced bus numbers
@@ -218,6 +219,12 @@ def _get_contingency_info(
         - Missing components indicate potential data quality issues
         - Transformer parsing is not fully implemented in current version
     """
+    # Extract the contingency name: the text following "CONTINGENCY" on the
+    # first line of the definition, trimmed of surrounding whitespace and
+    # quotes (single and double).
+    name_match = re.search(r'CONTINGENCY\s+(.*)', contingency, re.IGNORECASE)
+    contingency_name = name_match.group(1).strip().strip('\'"').strip() if name_match else ''
+
     # Extract bus numbers using regex pattern matching
     # Format: 'BUS######' where # represents digits
     bus_numbers = [int(num) for num in
@@ -225,7 +232,8 @@ def _get_contingency_info(
     bus_numbers = tuple(sorted(set(bus_numbers)))  # Remove duplicates and sort
 
     if not bus_numbers:
-        return ContingencyInfo(contingency_definition=contingency,
+        return ContingencyInfo(contingency_name=contingency_name,
+                               contingency_definition=contingency,
                                unique_areas=tuple(),
                                bus_numbers=tuple(),
                                lowest_voltage=0.0,
@@ -308,6 +316,7 @@ def _get_contingency_info(
 
     # Update return statement
     return ContingencyInfo(
+        contingency_name=contingency_name,
         contingency_definition=contingency,
         unique_areas=sorted(unique_areas),
         bus_numbers=bus_numbers,
@@ -402,11 +411,15 @@ def _read_contingency_definition_files(
     if not isinstance(model, Model):
         model = Model(model)
 
-    # Get list of contingency files from contingency_definitions_folder
+    # Get list of contingency files from contingency_definitions_folder.
+    # The RAW/RAWX network file may live in this same folder (it is discovered
+    # here too), so exclude it — otherwise it would be read as a contingency
+    # definition file.
     contingency_definition_file_names = [
         os.path.join(contingency_definitions_folder, f)
         for f in os.listdir(contingency_definitions_folder)
         if os.path.isfile(os.path.join(contingency_definitions_folder, f))
+        and not f.lower().endswith(('.raw', '.rawx'))
     ]
 
     if len(contingency_definition_file_names) > max_input_files:
@@ -712,7 +725,7 @@ def create_area_con_files(raw_file: str | Path | None = None,
 
     # Save some of the raw file model data to csv files for easy refrence.
     output_folder = output_folder if isinstance(output_folder, Path) else Path(output_folder)
-    folder = Path(args.output_folder)
+    folder = output_folder
     # Add bus info to other model data.
     model.network.append_bus_info_to_dfs()
     # Export raw file bus data.
@@ -756,7 +769,7 @@ if __name__ == '__main__':
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
         Examples:
-          %(prog)s -r network.raw -i contingencies/ -o output/
+          %(prog)s -r network.raw -i inputs/ -o output/
           %(prog)s --raw-file model.raw --low-kv 100 --high-kv 500
         """
     )
@@ -772,8 +785,8 @@ if __name__ == '__main__':
         '-i', '--input-folder',
         type=str,
         default='',
-        help=f'Folder containing contingency definition templates (default '
-             f'{DEFAULT_INPUT_FOLDER})')
+        help=f'Folder containing the contingency definition (.con) files AND '
+             f'the PSS/E RAW file (default {DEFAULT_INPUT_FOLDER})')
     parser.add_argument(
         '-o', '--output-folder',
         type=str,
