@@ -64,3 +64,7 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Idempotent re-dispatch: a version already on PyPI is skipped
+          # (no-op success) instead of failing with 400 File already exists.
+          skip-existing: true
