@@ -15,7 +15,7 @@ authors = [
 ]
 keywords = ["psse", "power systems", "RAW", "RAWX", "PSS/E"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
