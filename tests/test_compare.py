@@ -29,6 +29,24 @@ DEFAULT_KV_FILTER = RangeFilterType(1, 10_000)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _buses_in_alt_paths(alt_paths) -> set[int]:
+    """Collect every bus number appearing in a sectionalization/bypass row.
+
+    ``alt_paths`` is a list of paths; each path is a list of node tuples such
+    as ``('bus', 3013)``. Returns the set of bus numbers across all paths.
+    """
+    buses: set[int] = set()
+    for path in alt_paths:
+        for node in path:
+            if isinstance(node, tuple) and len(node) >= 2 and node[0] == "bus":
+                buses.add(node[1])
+    return buses
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -123,8 +141,12 @@ class TestCompareGraph:
 
     def test_added_and_removed_nodes(self, compared):
         _, graph_comp = compared
+        # Ground truth for the expanded Model_1/Model_2 fixtures. Model_2 adds
+        # buses 111, 156, 160, 161, 210, 219, 3013, 3014, 3111 (+ their
+        # gens/loads/shunts/transformers) and deletes buses 101, 152, 213,
+        # 2000, 2001, 3001, 3010 (+ their attached equipment).
         assert len(graph_comp["added_nodes"]) == 21
-        assert len(graph_comp["removed_nodes"]) == 18
+        assert len(graph_comp["removed_nodes"]) == 25
 
     def test_one_sectionalization(self, compared):
         _, graph_comp = compared
@@ -140,9 +162,169 @@ class TestCompareGraph:
         ]
         assert len(paths_with_3008) > 0
 
-    def test_no_bypasses(self, compared):
+    def test_sectionalization_alt_path_traverses_new_buses(self, compared):
+        """The 3008-3009 line was split by inserting new buses 3013 and 3014.
+
+        Model_1:  3008 ---------------------------- 3009
+        Model_2:  3008 --- 3013 --- 3014 --- 3009   (3013, 3014 are new)
+
+        The single sectionalization's original edge is 3008-3009 and its
+        alternate path must route through both newly-added intermediate buses.
+        """
+        _, graph_comp = compared
+        sec = graph_comp["path_sectionalizations"]
+        assert len(sec) == 1
+        row = sec.iloc[0]
+        assert set(row["original_path"]) == {("bus", 3008), ("bus", 3009)}
+        alt_buses = _buses_in_alt_paths(row["alternate_paths"])
+        assert {3013, 3014}.issubset(alt_buses)
+        # New intermediate buses must not have existed in Model_1.
+        assert {("bus", 3013), ("bus", 3014)}.issubset(graph_comp["added_nodes"])
+
+    def test_no_forward_bypasses(self, compared):
+        """No graph-level bypass is detectable in the model1->model2 direction.
+
+        The two documented AC-line merges do not surface as topological
+        bypasses, by design:
+          * 213-2000-214 -> 219-214 is masked by the concurrent 213->219 bus
+            rename (bus 219 does not exist in Model_1, so the merged edge has no
+            Model_1 endpoint to trace an alternate path from).
+          * 3003-2001-3005 -> 3003-3005 names the merged line CIRCUIT 2, but
+            Model_1 already carries a parallel 3003-3005 circuit 1, so the
+            simple graph already had that edge (no *new* edge is created).
+        A genuine bypass is exercised by the reversed comparison below.
+        """
         _, graph_comp = compared
         assert len(graph_comp["path_bypasses"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# compare_graph — reversed (bypass)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def reversed_graph_comp(raw_models):
+    """Graph comparison with the models swapped (Model_2 -> Model_1).
+
+    Reversing the comparison turns the Model_1->Model_2 line *split*
+    (sectionalization) into a line *merge* (bypass): the 3008-3013-3014-3009
+    chain in Model_2 collapses back to the direct 3008-3009 edge in Model_1.
+    """
+    model1, model2 = raw_models
+    return ModelComparison(model2, model1).compare_graph()
+
+
+class TestCompareGraphBypass:
+    """The reversed comparison exercises path_bypasses (line merge)."""
+
+    def test_one_bypass(self, reversed_graph_comp):
+        byp = reversed_graph_comp["path_bypasses"]
+        assert len(byp) == 1, "Expected exactly one path bypass"
+
+    def test_no_sectionalizations_in_reverse(self, reversed_graph_comp):
+        # The split, viewed backwards, is a merge — not a split.
+        assert len(reversed_graph_comp["path_sectionalizations"]) == 0
+
+    def test_bypass_merges_3008_3009(self, reversed_graph_comp):
+        """The merged edge is 3008-3009; its Model_2 path ran through the
+        now-removed intermediate buses 3013 and 3014."""
+        byp = reversed_graph_comp["path_bypasses"]
+        row = byp.iloc[0]
+        assert set(row["original_path"]) == {("bus", 3008), ("bus", 3009)}
+        alt_buses = _buses_in_alt_paths(row["alternate_paths"])
+        assert {3013, 3014}.issubset(alt_buses)
+        # From the reversed viewpoint the intermediate buses are *removed*.
+        assert {("bus", 3013), ("bus", 3014)}.issubset(
+            reversed_graph_comp["removed_nodes"]
+        )
+
+    def test_bypass_named_columns_present(self, reversed_graph_comp):
+        byp = reversed_graph_comp["path_bypasses"]
+        for col in ("original_path_named", "alternate_paths_named"):
+            assert col in byp.columns
+        assert "3008" in byp.iloc[0]["original_path_named"]
+
+
+# ---------------------------------------------------------------------------
+# New structural scenarios enabled by the expanded fixtures
+# ---------------------------------------------------------------------------
+
+class TestNewScenarios:
+    """DataFrame-level coverage for scenarios documented in
+    ``Model_1 and 2 differences.txt`` that the expanded Model_2 now exercises."""
+
+    @pytest.mark.parametrize("bus_num", [2000, 2001, 3010])
+    def test_bus_deletions(self, compared, bus_num):
+        """Buses 2000 (merge + gen removal), 2001 (merge), 3010 (3W->2W)."""
+        df_comp, _ = compared
+        bus_df = df_comp["bus"]
+        assert bus_num in bus_df.index
+        assert bus_df.loc[bus_num, "presence"] == "model1_only"
+
+    @pytest.mark.parametrize("bus_num", [3013, 3014, 156, 161, 210])
+    def test_bus_additions(self, compared, bus_num):
+        """New buses: 3013/3014 (line split), 156 (new load/gen/branch),
+        161 (new shunts), 210 (2W->3W transformer)."""
+        df_comp, _ = compared
+        bus_df = df_comp["bus"]
+        assert bus_num in bus_df.index
+        assert bus_df.loc[bus_num, "presence"] == "model2_only"
+
+    def test_load_id_change(self, compared):
+        """Load at bus 153 changed loadid from '1' to '10'."""
+        df_comp, _ = compared
+        load = df_comp["load"]
+        assert load.loc[(153, "1"), "presence"] == "model1_only"
+        assert load.loc[(153, "10"), "presence"] == "model2_only"
+
+    def test_load_added_and_removed(self, compared):
+        """Load (156,'AA') added; load (205,'C') removed."""
+        df_comp, _ = compared
+        load = df_comp["load"]
+        assert load.loc[(156, "AA"), "presence"] == "model2_only"
+        assert load.loc[(205, "C"), "presence"] == "model1_only"
+
+    def test_load_id_rename_201(self, compared):
+        """Load at bus 201 changed loadid from 'SC' to 'SA'."""
+        df_comp, _ = compared
+        load = df_comp["load"]
+        assert load.loc[(201, "SC"), "presence"] == "model1_only"
+        assert load.loc[(201, "SA"), "presence"] == "model2_only"
+
+    def test_generator_deleted_with_bus(self, compared):
+        """The generator at bus 2000 is removed along with its bus (merge)."""
+        df_comp, _ = compared
+        gen = df_comp["generator"]
+        assert gen.loc[(2000, "1"), "presence"] == "model1_only"
+
+    def test_generator_added(self, compared):
+        """New generator 'GG' added at new bus 156."""
+        df_comp, _ = compared
+        gen = df_comp["generator"]
+        assert gen.loc[(156, "GG"), "presence"] == "model2_only"
+
+    def test_generator_bus_and_id_rename(self, compared):
+        """Generator moved from (101,'1') to (111,'A') with the 101->111 bus
+        rename."""
+        df_comp, _ = compared
+        gen = df_comp["generator"]
+        assert gen.loc[(101, "1"), "presence"] == "model1_only"
+        assert gen.loc[(111, "A"), "presence"] == "model2_only"
+
+    @pytest.mark.parametrize("old,new", [(101, 111), (213, 219), (152, 160)])
+    def test_bus_num_changes_detected(self, model_comparison, old, new):
+        """Renumberings that preserve the bus name+area are detected."""
+        changes = model_comparison.bus_num_changes()
+        assert any((changes["ibus_model1"] == old)
+                   & (changes["ibus_model2"] == new)), f"{old}->{new} not found"
+
+    def test_bus_num_change_with_name_change_not_detected(self, model_comparison):
+        """Bus 3001->3111 also changed name (MINE->YOURS). bus_num_changes()
+        inner-joins on name+area, so a simultaneous number+name change is *not*
+        matched as a renumbering — a documented limitation of the heuristic."""
+        changes = model_comparison.bus_num_changes()
+        assert not any((changes["ibus_model1"] == 3001)
+                       & (changes["ibus_model2"] == 3111))
 
 
 # ---------------------------------------------------------------------------

@@ -205,6 +205,7 @@ SCENARIOS:
 	GEN DATA
 
 	ibus 401 changed pg from 321.000 to 531.000
+	ibus 401 changed pt from 350.000 to 600.000
 	ibus 401 changed qg from 142.325 to 150.000
 	ibus 401 changed qt from 600.000 to 500.000
 	ibus 401 changed qb from -100.000 to -90.000
@@ -401,5 +402,9 @@ SCENARIOS:
 	ibus 3022 changed b1 from 100.00 to 200.00
 
 
+-AC Line Branch ID change
 
+	AC LINE DATA
+
+	ibus 151 - jbus 160 branch ID changed from 1 to Z1
 --------------------------------------------------------------------------------------------
